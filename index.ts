@@ -346,6 +346,168 @@ async function fetchMessageById(messageId: string): Promise<FetchedMessage | nul
   }
 }
 
+/**
+ * Parse a raw email source into a FetchedMessage.
+ */
+function parseEmailSource(source: Buffer, envelope: any): FetchedMessage {
+  const sourceText = source.toString("utf-8");
+  const headerBodySplit = sourceText.split(/\r?\n\r?\n/);
+  const headers = headerBodySplit[0];
+  const rawBody = headerBodySplit.slice(1).join("\n\n");
+
+  let plainBody = "";
+  let htmlBody = "";
+
+  const boundaryMatch = headers.match(/boundary="?([^"\r\n]+)"?/i);
+  if (boundaryMatch) {
+    const boundary = boundaryMatch[1];
+    const escapedBoundary = boundary.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const parts = rawBody.split(new RegExp(`--${escapedBoundary}`));
+
+    for (const part of parts) {
+      if (part.includes("Content-Type: text/plain")) {
+        const textContent = part.split(/\r?\n\r?\n/).slice(1).join("\n\n");
+        plainBody = decodeQuotedPrintable(textContent);
+      }
+      else if (part.includes("Content-Type: text/html")) {
+        const htmlContent = part.split(/\r?\n\r?\n/).slice(1).join("\n\n");
+        htmlBody = decodeQuotedPrintable(htmlContent);
+      }
+    }
+  }
+  else {
+    plainBody = decodeQuotedPrintable(rawBody);
+  }
+
+  const fromAddr = envelope.from?.[0];
+  const toAddr = envelope.to?.[0];
+
+  return {
+    messageId: envelope.messageId || "",
+    from: fromAddr ? `${fromAddr.name || ""} <${fromAddr.address}>`.trim() : "Unknown",
+    to: toAddr ? `${toAddr.name || ""} <${toAddr.address}>`.trim() : "Unknown",
+    subject: envelope.subject || "(no subject)",
+    date: envelope.date || new Date(),
+    body: plainBody.trim(),
+    html: htmlBody.trim() || undefined,
+    references: envelope.inReplyTo,
+  };
+}
+
+/**
+ * Get the next unread message, or wait for one.
+ * First checks existing unseen messages, then polls for new arrivals.
+ */
+async function nextMessage(options: {
+  from?: string;
+  subject?: string;
+  timeout: number;
+}): Promise<FetchedMessage | null> {
+  validateImapConfig();
+
+  const imapConfig = getImapConfig();
+  const startTime = Date.now();
+  const pollInterval = 2000;
+
+  log("Looking for next message", { from: options.from, subject: options.subject, timeout: options.timeout });
+
+  const client = new ImapFlow({
+    host: imapConfig.host,
+    port: imapConfig.port,
+    secure: imapConfig.secure,
+    auth: {
+      user: imapConfig.user,
+      pass: imapConfig.pass,
+    },
+    tls: { rejectUnauthorized: false },
+    logger: false,
+  });
+
+  await client.connect();
+  log("IMAP connected");
+
+  const lock = await client.getMailboxLock("INBOX");
+
+  try {
+    // First, check for existing unseen messages
+    const unseenUids = await client.search({ seen: false });
+    log("Unseen messages:", unseenUids.length);
+
+    if (unseenUids.length > 0) {
+      // Check unseen messages from oldest to newest
+      for (const uid of unseenUids) {
+        const msg = await client.fetchOne(uid, { envelope: true, source: true, flags: true });
+
+        const fromAddr = msg.envelope.from?.[0];
+        const fromString = fromAddr ? `${fromAddr.name || ""} <${fromAddr.address}>`.trim() : "";
+
+        // Apply filters
+        if (options.from && !fromString.toLowerCase().includes(options.from.toLowerCase())) {
+          log("Skipping (from filter):", fromString);
+          continue;
+        }
+
+        if (options.subject && !msg.envelope.subject?.toLowerCase().includes(options.subject.toLowerCase())) {
+          log("Skipping (subject filter):", msg.envelope.subject);
+          continue;
+        }
+
+        // Mark as seen
+        await client.messageFlagsAdd(uid, ["\\Seen"]);
+        log("Marked as seen:", uid);
+
+        return parseEmailSource(msg.source, msg.envelope);
+      }
+    }
+
+    // No matching unseen messages, wait for new ones
+    log("No matching unseen messages, waiting for new arrivals...");
+    const initialStatus = await client.status("INBOX", { uidNext: true });
+    let lastUidNext = initialStatus.uidNext || 0;
+
+    while (Date.now() - startTime < options.timeout * 1000) {
+      await new Promise((resolve) => setTimeout(resolve, pollInterval));
+
+      const status = await client.status("INBOX", { uidNext: true });
+
+      if (status.uidNext && status.uidNext > lastUidNext) {
+        log("New message detected");
+
+        // Check new unseen messages
+        const newUnseenUids = await client.search({ seen: false });
+        for (const uid of newUnseenUids) {
+          const msg = await client.fetchOne(uid, { envelope: true, source: true });
+
+          const fromAddr = msg.envelope.from?.[0];
+          const fromString = fromAddr ? `${fromAddr.name || ""} <${fromAddr.address}>`.trim() : "";
+
+          if (options.from && !fromString.toLowerCase().includes(options.from.toLowerCase())) {
+            continue;
+          }
+
+          if (options.subject && !msg.envelope.subject?.toLowerCase().includes(options.subject.toLowerCase())) {
+            continue;
+          }
+
+          await client.messageFlagsAdd(uid, ["\\Seen"]);
+          return parseEmailSource(msg.source, msg.envelope);
+        }
+
+        lastUidNext = status.uidNext;
+      }
+
+      log("Polling... elapsed:", Math.round((Date.now() - startTime) / 1000), "s");
+    }
+
+    return null; // Timeout
+  }
+  finally {
+    lock.release();
+    await client.logout();
+    log("IMAP disconnected");
+  }
+}
+
 // ---------------------------------------------------------------------------
 // SMTP Operations
 // ---------------------------------------------------------------------------
@@ -415,21 +577,29 @@ async function sendEmail(options: SendOptions) {
 // ---------------------------------------------------------------------------
 
 function printUsage() {
-  console.error("Usage: bun run index.ts <send|reply> <to> <subject> [options]");
+  console.error("Usage: claude-mailer <command> [options]");
   console.error("");
   console.error("Commands:");
-  console.error("  send   Send a new email");
-  console.error("  reply  Send a reply with threading");
+  console.error("  send <to> <subject>    Send a new email (body via stdin)");
+  console.error("  reply <to> <subject>   Send a reply with threading (body via stdin)");
+  console.error("  next                   Get next unread message, or wait for one");
   console.error("");
-  console.error("Options:");
+  console.error("Options for send/reply:");
   console.error("  --quote-message-id=<id>  Message-ID to reply to (auto-fetches and quotes)");
   console.error("  --in-reply-to=<id>       Message-ID for threading only (no quote)");
   console.error("  --references=<ids>       Full references chain");
-  console.error("  --verbose                Enable debug output");
+  console.error("");
+  console.error("Options for next:");
+  console.error("  --from=<email>         Filter by sender (partial match)");
+  console.error("  --subject=<text>       Filter by subject (partial match)");
+  console.error("  --timeout=<seconds>    Wait timeout in seconds (default: 60)");
+  console.error("");
+  console.error("Global options:");
+  console.error("  --verbose              Enable debug output");
   console.error("");
   console.error("Input: Plain text or HTML via stdin.");
   console.error("       For markdown, pipe through pandoc first:");
-  console.error("       cat msg.md | pandoc -f markdown -t html | bun run index.ts send ...");
+  console.error("       cat msg.md | pandoc -f markdown -t html | claude-mailer send ...");
 }
 
 async function main() {
@@ -438,7 +608,7 @@ async function main() {
   const args = process.argv.slice(2);
   const command = args[0];
 
-  if (!command || !["send", "reply"].includes(command)) {
+  if (!command || !["send", "reply", "next"].includes(command)) {
     printUsage();
     process.exit(1);
   }
@@ -450,12 +620,39 @@ async function main() {
       "in-reply-to": { type: "string" },
       "references": { type: "string" },
       "verbose": { type: "boolean", short: "v" },
+      "from": { type: "string" },
+      "subject": { type: "string" },
+      "timeout": { type: "string" },
     },
     allowPositionals: true,
   });
 
   verbose = values.verbose || false;
 
+  // Handle next command
+  if (command === "next") {
+    const timeout = parseInt(values.timeout || "60");
+    log("Command: next");
+    log("Filters:", { from: values.from, subject: values.subject, timeout });
+
+    const message = await nextMessage({
+      from: values.from,
+      subject: values.subject,
+      timeout,
+    });
+
+    if (message) {
+      // Output as JSON for easy parsing
+      console.log(JSON.stringify(message, null, 2));
+      process.exit(0);
+    }
+    else {
+      console.error("Timeout: No matching message received");
+      process.exit(1);
+    }
+  }
+
+  // Handle send/reply commands
   const [to, subject] = positionals;
 
   if (!to || !subject) {
