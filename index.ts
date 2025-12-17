@@ -65,26 +65,55 @@
 import nodemailer from "nodemailer";
 import { ImapFlow } from "imapflow";
 import { parseArgs } from "util";
+import { homedir } from "os";
+import { join } from "path";
 
 // ---------------------------------------------------------------------------
 // Configuration
 // ---------------------------------------------------------------------------
 
-const smtpConfig = {
-  host: process.env.SMTP_HOST || "127.0.0.1",
-  port: parseInt(process.env.SMTP_PORT || "1025"),
-  user: process.env.SMTP_USER || "",
-  pass: process.env.SMTP_PASS || "",
-  secure: process.env.SMTP_SECURITY === "SSL",
-};
+// Auto-load config from ~/.config/claude-mailer/.env if not already set
+async function loadConfig() {
+  const configPath = join(homedir(), ".config", "claude-mailer", ".env");
+  if (process.env.SMTP_USER) return; // Already configured
 
-const imapConfig = {
-  host: process.env.IMAP_HOST || "127.0.0.1",
-  port: parseInt(process.env.IMAP_PORT || "1143"),
-  user: process.env.IMAP_USER || "",
-  pass: process.env.IMAP_PASS || "",
-  secure: process.env.IMAP_SECURITY === "SSL",
-};
+  try {
+    const envFile = Bun.file(configPath);
+    if (await envFile.exists()) {
+      const content = await envFile.text();
+      for (const line of content.split("\n")) {
+        const [key, ...valueParts] = line.split("=");
+        const value = valueParts.join("=").trim();
+        if (key && value && !process.env[key.trim()]) {
+          process.env[key.trim()] = value;
+        }
+      }
+    }
+  }
+  catch {
+    // Config file not found, rely on environment variables
+  }
+}
+
+function getSmtpConfig() {
+  return {
+    host: process.env.SMTP_HOST || "127.0.0.1",
+    port: parseInt(process.env.SMTP_PORT || "1025"),
+    user: process.env.SMTP_USER || "",
+    pass: process.env.SMTP_PASS || "",
+    secure: process.env.SMTP_SECURITY === "SSL",
+  };
+}
+
+function getImapConfig() {
+  return {
+    host: process.env.IMAP_HOST || "127.0.0.1",
+    port: parseInt(process.env.IMAP_PORT || "1143"),
+    user: process.env.IMAP_USER || "",
+    pass: process.env.IMAP_PASS || "",
+    secure: process.env.IMAP_SECURITY === "SSL",
+  };
+}
 
 let verbose = false;
 
@@ -123,17 +152,19 @@ interface SendOptions {
 // ---------------------------------------------------------------------------
 
 function validateSmtpConfig() {
-  if (!smtpConfig.user || !smtpConfig.pass) {
+  const config = getSmtpConfig();
+  if (!config.user || !config.pass) {
     console.error("Error: SMTP_USER and SMTP_PASS environment variables required");
-    console.error("Create a .env file with your Proton Bridge credentials.");
+    console.error("Create ~/.config/claude-mailer/.env with your Proton Bridge credentials.");
     process.exit(1);
   }
 }
 
 function validateImapConfig() {
-  if (!imapConfig.user || !imapConfig.pass) {
+  const config = getImapConfig();
+  if (!config.user || !config.pass) {
     console.error("Error: IMAP_USER and IMAP_PASS environment variables required");
-    console.error("Create a .env file with your Proton Bridge credentials.");
+    console.error("Create ~/.config/claude-mailer/.env with your Proton Bridge credentials.");
     process.exit(1);
   }
 }
@@ -224,6 +255,7 @@ function decodeQuotedPrintable(text: string): string {
 async function fetchMessageById(messageId: string): Promise<FetchedMessage | null> {
   validateImapConfig();
 
+  const imapConfig = getImapConfig();
   log("Connecting to IMAP", { host: imapConfig.host, port: imapConfig.port });
 
   const client = new ImapFlow({
@@ -325,6 +357,7 @@ async function fetchMessageById(messageId: string): Promise<FetchedMessage | nul
 async function sendEmail(options: SendOptions) {
   validateSmtpConfig();
 
+  const smtpConfig = getSmtpConfig();
   log("Connecting to SMTP", { host: smtpConfig.host, port: smtpConfig.port, secure: smtpConfig.secure });
 
   const transporter = nodemailer.createTransport({
@@ -400,6 +433,8 @@ function printUsage() {
 }
 
 async function main() {
+  await loadConfig();
+
   const args = process.argv.slice(2);
   const command = args[0];
 

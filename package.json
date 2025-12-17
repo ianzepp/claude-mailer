@@ -2,7 +2,9 @@
   "name": "claude-mailer",
   "module": "index.ts",
   "type": "module",
-  "private": true,
+  "bin": {
+    "claude-mailer": "./index.ts"
+  },
   "devDependencies": {
     "@types/bun": "latest",
     "@types/nodemailer": "^7.0.4"
